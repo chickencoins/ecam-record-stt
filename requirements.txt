@@ -1,0 +1,5 @@
+faster-whisper==1.2.1
+av==16.1.0
+PyAudioWPatch==0.2.12.8
+pyinstaller==6.22.3
+Pillow>=11,<13
