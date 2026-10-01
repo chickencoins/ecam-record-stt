@@ -18,6 +18,8 @@ from recorder import SystemRecorder
 
 ASSETS = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'web'
 HOME = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+if getattr(sys, 'frozen', False) and os.environ.get('ECAM_EXE_HOME'):
+    HOME = Path(os.environ['ECAM_EXE_HOME']).resolve()
 
 
 class App:
@@ -37,7 +39,7 @@ class App:
         self.last_seen = time.monotonic()
         self.terms = ''
         self.engine = 'large-v3'
-        self.device = 'cpu'
+        self.device = 'auto'
         self.paragraph_seconds = 60
         self.shutdown_event = threading.Event()
 
@@ -74,7 +76,7 @@ class App:
         engine = data.get('engine', 'large-v3')
         if engine not in ('large-v3', 'turbo'):
             raise ValueError('알 수 없는 STT 모델입니다.')
-        device = data.get('device', 'cpu')
+        device = data.get('device', 'auto')
         paragraph = int(data.get('paragraph_seconds', 60))
         if device not in ('auto', 'cpu') or paragraph not in (0, 30, 60, 120, 300):
             raise ValueError('처리 장치와 문단 길이를 확인하세요.')
@@ -350,9 +352,20 @@ def main():
     parser.add_argument('--data-dir', type=Path)
     parser.add_argument('--output-dir', type=Path)
     args = parser.parse_args()
-    data = args.data_dir or Path(os.environ.get('LOCALAPPDATA', str(HOME))) / 'ecam_recordSTT'
+    data = args.data_dir or HOME / 'ecam_recordSTT_data'
     output = args.output_dir or HOME / 'ecam_recordSTT_output'
+    for location in (data, output):
+        if not location.resolve().is_relative_to(HOME.resolve()):
+            raise ValueError('저장 위치는 EXE 폴더 내부여야 합니다.')
     data.mkdir(parents=True, exist_ok=True)
+    temporary = data / 'temp'
+    temporary.mkdir(parents=True, exist_ok=True)
+    os.environ['TEMP'] = os.environ['TMP'] = str(temporary)
+    os.environ['HF_HOME'] = str(data / 'huggingface')
+    os.environ['HF_HUB_CACHE'] = str(data / 'models')
+    os.environ['XDG_CACHE_HOME'] = str(data / 'cache')
+    import tempfile
+    tempfile.tempdir = str(temporary)
     # Keep one app instance per data directory. The lock is released by Windows after a crash.
     import msvcrt
     lock_path = data / 'instance.lock'

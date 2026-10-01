@@ -24,7 +24,8 @@ def enable_gpu_libraries():
     global _GPU_PATHS_READY
     if _GPU_PATHS_READY or os.name != 'nt':
         return
-    roots = []
+    home = Path(os.environ.get('ECAM_EXE_HOME', str(Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent)))
+    roots = [home / 'ecam_recordSTT_data' / 'gpu']
     if os.environ.get('ECAM_GPU_DIR'):
         roots.append(Path(os.environ['ECAM_GPU_DIR']))
     if os.environ.get('CUDA_PATH'):
@@ -264,7 +265,7 @@ class Transcriber:
         self.models = models
         self.loaded = None
         self.loaded_id = None
-        self.device_preference = 'cpu'
+        self.device_preference = 'auto'
         self.device_used = ''
         self.device_note = ''
 

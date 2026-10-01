@@ -4,6 +4,7 @@ import importlib.metadata as metadata
 import json
 import subprocess
 import sys
+import os
 
 ROOT = Path(__file__).resolve().parent
 
@@ -50,11 +51,18 @@ def keep(entry):
 a.binaries = [entry for entry in a.binaries if keep(entry)]
 a.datas = [entry for entry in a.datas if keep(entry)]
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='ecam_recordSTT',
+exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='engine',
     debug=False, strip=False, upx=False, console=False)
 ''', 'utf-8')
     subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', str(spec)],
                    cwd=ROOT, check=True)
+    compiler = Path(os.environ['WINDIR']) / 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+    subprocess.run([str(compiler), '/nologo', '/target:winexe', '/platform:x64',
+                    '/reference:System.Windows.Forms.dll',
+                    '/out:' + str(ROOT / 'dist/ecam_recordSTT.exe'),
+                    '/resource:' + str(ROOT / 'dist/engine.exe') + ',engine',
+                    str(ROOT / 'launcher.cs')], check=True)
+    (ROOT / 'dist/engine.exe').unlink()
 
 
 if __name__ == '__main__':
