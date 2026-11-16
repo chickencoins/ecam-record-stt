@@ -20,6 +20,7 @@ ASSETS = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'web'
 HOME = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
 if getattr(sys, 'frozen', False) and os.environ.get('ECAM_EXE_HOME'):
     HOME = Path(os.environ['ECAM_EXE_HOME']).resolve()
+CLOSING_NOTE = '\n잠시 후 프로그램을 자동 종료합니다.'
 
 
 class App:
@@ -36,11 +37,13 @@ class App:
         self.message = '준비되었습니다. Start를 누른 뒤 강의를 재생하세요.'
         self.progress = 0
         self.result = ''
-        self.last_seen = time.monotonic()
         self.terms = ''
         self.engine = 'large-v3'
         self.device = 'auto'
         self.paragraph_seconds = 60
+        self.auto_exit = False
+        self.closing_at = None
+        self.page_closed_at = None
         self.shutdown_event = threading.Event()
 
     def update(self, message, progress=0):
@@ -60,7 +63,7 @@ class App:
 
     def status(self):
         with self.lock:
-            self.last_seen = time.monotonic()
+            self.page_closed_at = None
             return {'state': self.state, 'message': self.message, 'progress': self.progress,
                     'seconds': self.session.seconds if self.session else 0,
                     'level': self.session.level if self.session else 0,
@@ -70,6 +73,8 @@ class App:
                     'image_count': self.session.meta.get('image_count', 0) if self.session else 0,
                     'image_error': self.session.meta.get('image_error', '') if self.session else '',
                     'image_dir': self.session.meta.get('image_dir', '') if self.session else '',
+                    'limit': self.session.meta.get('duration_limit', 0) if self.session else 0,
+                    'auto_exit': self.auto_exit, 'closing': self.closing_at is not None,
                     'pending': self.pending() if self.state not in ('recording', 'transcribing') else []}
 
     def options(self, data):
@@ -95,6 +100,9 @@ class App:
             capture_interval = int(data.get('capture_interval', 30))
             if not 1 <= capture_interval <= 3600:
                 raise ValueError('캡처 간격은 1~3600초여야 합니다.')
+            minutes = int(data.get('duration_minutes', 0))
+            if not 0 <= minutes <= 600:
+                raise ValueError('녹음 시간은 1~600분이어야 합니다.')
             if screenshots and source != 'tab':
                 raise ValueError('이미지 캡처는 Chrome 탭 모드에서 사용할 수 있습니다.')
             rate = int(data.get('rate', 16000))
@@ -106,13 +114,14 @@ class App:
                 self.session = Session.create(self.sessions, data.get('title', '강의'), rate, source, self.engine)
                 self.session.meta['paragraph_seconds'] = self.paragraph_seconds
                 self.session.meta.update(screenshots=screenshots, capture_interval=capture_interval,
-                                         image_count=0, image_error='')
+                                         image_count=0, image_error='', duration_limit=minutes * 60)
                 self.session.save()
                 self.recorder = recorder
                 if recorder:
                     recorder.start(self.session)
                 self.state, self.result, self.progress = 'recording', '', 0
-                self.message = '녹음 중 · 강의가 끝나면 Stop을 누르세요.'
+                self.message = (f'녹음 중 · {minutes}분 후 자동으로 Stop하고 TXT를 만듭니다.' if minutes
+                                else '녹음 중 · 강의가 끝나면 Stop을 누르세요.')
                 return {'id': self.session.meta['id']}
             except Exception:
                 if recorder:
@@ -170,6 +179,10 @@ class App:
                 self.message = warning or '완료 · TXT 저장을 검증하고 임시 녹음을 삭제했습니다.'
                 if session.meta.get('image_error'):
                     self.message += '\n이미지 캡처 중 일부 오류가 있었습니다. TXT의 알림을 확인하세요.'
+                if self.auto_exit:
+                    # Leave a few seconds so the page can show completion before the server stops.
+                    self.closing_at = time.monotonic() + 5
+                    self.message += CLOSING_NOTE
         except Exception as e:
             with self.lock:
                 self.state = 'error'
@@ -195,6 +208,13 @@ class App:
             self.session.meta['paragraph_seconds'] = self.paragraph_seconds
             self.session.save()
             self.begin_transcription()
+
+    def set_auto_exit(self, enabled):
+        with self.lock:
+            self.auto_exit = enabled
+            if not enabled and self.closing_at is not None:
+                self.closing_at = None
+                self.message = self.message.replace(CLOSING_NOTE, '')
 
     def prepare_model(self, data):
         with self.lock:
@@ -225,18 +245,34 @@ class App:
             if os.name == 'nt' and busy != active:
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000001 if busy else 0x80000000)
                 active = busy
-            if self.state == 'recording' and self.recorder and self.recorder.error:
-                self.stop(self.recorder.error)
-            if self.state == 'recording' and self.session.meta['source'] == 'tab' and time.monotonic() - self.session.last_audio > 25:
-                self.stop('탭 오디오 수신이 25초 이상 중단되었습니다.')
-            if time.monotonic() - self.last_seen > 100:
-                if self.state == 'recording':
-                    self.stop('녹음 창과 연결이 끊겼습니다.')
-                if self.state != 'transcribing':
-                    self.shutdown_event.set()
+            try:
+                self.check(time.monotonic())
+            except ValueError:
+                pass  # The page stopped the recording at the same moment.
         if os.name == 'nt':
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
         server.shutdown()
+
+    def check(self, now):
+        with self.lock:
+            if self.closing_at is not None and now >= self.closing_at:
+                self.shutdown_event.set()
+            if self.state != 'recording':
+                if self.page_closed_at is not None and now - self.page_closed_at > 15 and self.state != 'transcribing':
+                    self.shutdown_event.set()
+                return
+            if self.recorder and self.recorder.error:
+                return self.stop(self.recorder.error)
+            tab = self.session.meta['source'] == 'tab'
+            if tab and now - self.session.last_audio > 25:
+                return self.stop('탭 오디오 수신이 25초 이상 중단되었습니다.')
+            limit = self.session.meta.get('duration_limit', 0)
+            # The tab page stops itself on time; the server only steps in if that page stalls.
+            if limit and self.session.seconds >= limit + (30 if tab else 0):
+                return self.stop()
+            # Hidden or minimized windows poll rarely, so only an explicit page close ends recording.
+            if self.page_closed_at is not None and now - self.page_closed_at > 15:
+                self.stop('녹음 창이 닫혔습니다.')
 
 
 def handler_for(app, token):
@@ -314,6 +350,10 @@ def handler_for(app, token):
                     app.stop(str(data.get('error', ''))[:1000], data.get('seq'), str(data.get('image_error', ''))[:1000])
                 elif route == 'retry':
                     app.retry(data)
+                elif route == 'closed':
+                    app.page_closed_at = time.monotonic()
+                elif route == 'auto-exit':
+                    app.set_auto_exit(data.get('enabled') is True)
                 elif route == 'model':
                     app.prepare_model(data)
                 elif route == 'folder':

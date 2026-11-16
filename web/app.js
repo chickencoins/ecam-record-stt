@@ -4,6 +4,7 @@ let stream = null, context = null, node = null, sourceNode = null, sid = '', seq
 let uploads = Promise.resolve(), uploadError = '', buffered = 0, stopping = false, starting = false;
 let state = 'idle', recording = false, stoppedResolve = null, lastPending = '', localError = '';
 let captureWorker=null, captureTrack=null, captureStopped=null, imageError='';
+let limit = 0, failures = 0, closing = false, autoExitSynced = false;
 const base = new URL('.', location.href);
 async function api(path, data) {
   const options = data === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)};
@@ -13,7 +14,8 @@ async function api(path, data) {
   if (!response.ok) throw new Error(result.error || '프로그램과 통신하지 못했습니다.');
   return result;
 }
-function settings() { return {title: $('title').value || '강의', source: $('source').value, engine: $('engine').value, terms: $('terms').value, device:$('device').value, paragraph_seconds:Number($('paragraph').value), screenshots:$('screenshots').checked, capture_interval:Number($('captureInterval').value)}; }
+function settings() { return {title: $('title').value || '강의', source: $('source').value, engine: $('engine').value, terms: $('terms').value, device:$('device').value, paragraph_seconds:Number($('paragraph').value), screenshots:$('screenshots').checked, capture_interval:Number($('captureInterval').value), duration_minutes:$('timed').checked ? Number($('duration').value) : 0}; }
+function clock(n) { return [Math.floor(n/3600),Math.floor(n/60)%60,n%60].map(v=>String(v).padStart(2,'0')).join(':'); }
 function error(e) { localError = e.message || String(e); $('message').textContent = localError; }
 function labels() {
   $('prepare').disabled = ['recording','transcribing'].includes(state);
@@ -21,6 +23,7 @@ function labels() {
   if(!tab) $('screenshots').checked=false;
   $('screenshots').disabled=!tab || ['recording','transcribing'].includes(state);
   $('captureInterval').disabled=!$('screenshots').checked || ['recording','transcribing'].includes(state);
+  $('duration').disabled=!$('timed').checked || ['recording','transcribing'].includes(state);
   $('sourceHint').textContent = tab ? '공유 창의 ‘Chrome 탭’에서 강의를 선택하고 ‘탭 오디오 공유’를 켜세요. 다른 탭의 소리는 제외됩니다.' : 'Windows 기본 출력 장치의 모든 소리를 녹음합니다. 이미지 캡처는 Chrome 탭 모드에서 사용할 수 있습니다.';
 }
 function queueAudio(buffer) {
@@ -48,6 +51,7 @@ async function start() {
   const opts = settings();
   try {
     if(opts.screenshots && (opts.capture_interval < 1 || opts.capture_interval > 3600 || !Number.isInteger(opts.capture_interval))) throw new Error('캡처 간격은 1~3600초로 입력하세요.');
+    if($('timed').checked && (opts.duration_minutes < 1 || opts.duration_minutes > 600 || !Number.isInteger(opts.duration_minutes))) throw new Error('녹음 시간은 1~600분으로 입력하세요.');
     if (opts.source === 'tab') {
       // Must be invoked directly by the Start click, before any asynchronous server request.
       stream = await navigator.mediaDevices.getDisplayMedia({video:{displaySurface:'browser',frameRate:1},
@@ -63,11 +67,12 @@ async function start() {
     }
     const result = await api('start', opts);
     sid = result.id; seq = 0; buffered = 0; uploads = Promise.resolve(); uploadError = ''; recording = true;
-    imageError='';
+    imageError=''; limit = opts.duration_minutes * 60;
     if (opts.source === 'tab') {
       node = new AudioWorkletNode(context, 'pcm-recorder');
       node.port.onmessage = e => {
-        if (e.data.audio) queueAudio(e.data.audio);
+        // Each chunk is one second of audio, and worklet messages are not throttled in hidden windows.
+        if (e.data.audio) { queueAudio(e.data.audio); if (limit && seq >= limit) stop(); }
         if (e.data.stopped && stoppedResolve) { stoppedResolve(); stoppedResolve = null; }
       };
       sourceNode = context.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
@@ -114,10 +119,27 @@ async function stop(reason = '') {
   } catch(e) { error(e); }
   finally { recording = false; await release(); stopping = false; poll(); }
 }
+function closed() {
+  clearInterval(timer);
+  $('message').textContent = '전사가 완료되어 프로그램이 자동 종료되었습니다. 이 창을 닫으세요.';
+  window.close();
+}
 async function poll() {
+  let s;
   try {
-    const s = await api('status');
+    s = await api('status');
+  } catch(e) {
+    if (closing) return closed();
+    // A hidden, sleeping or busy PC can miss a poll; only report after repeated failures.
+    if (++failures >= 3 && !stopping) $('message').textContent = '프로그램과 다시 연결하는 중입니다… 계속되면 EXE를 다시 실행하세요. 보존된 녹음은 다시 변환할 수 있습니다.';
+    return;
+  }
+  failures = 0;
+  try {
     state = s.state;
+    // A throttled hidden window may miss the short closing notice, so completion with auto-exit counts too.
+    closing = s.closing || (state === 'complete' && s.auto_exit);
+    if (!autoExitSynced) { $('autoExit').checked = s.auto_exit; autoExitSynced = true; }
     if (recording && state !== 'recording' && !stopping) { recording = false; await release(); }
     const busy = ['recording','transcribing'].includes(state);
     $('start').disabled = busy || starting;
@@ -125,10 +147,13 @@ async function poll() {
     for (const id of ['title','source','engine','terms','paragraph','device']) $(id).disabled = busy || starting;
     $('screenshots').disabled=busy || starting || $('source').value!=='tab';
     $('captureInterval').disabled=busy || starting || !$('screenshots').checked;
+    $('timed').disabled=busy || starting;
+    $('duration').disabled=busy || starting || !$('timed').checked;
     $('prepare').disabled = busy;
     $('exit').disabled = busy;
     $('state').textContent = {idle:'준비',recording:'● 녹음 중',transcribing:'텍스트 변환 중',complete:'저장 완료',error:'확인 필요'}[state] || state;
-    const n = Math.floor(s.seconds); $('clock').textContent = [Math.floor(n/3600),Math.floor(n/60)%60,n%60].map(v=>String(v).padStart(2,'0')).join(':');
+    const n = Math.floor(s.seconds); $('clock').textContent = clock(n);
+    if (state === 'recording' && s.limit) $('state').textContent += ` · 자동 Stop까지 ${clock(Math.max(0, s.limit - n))}`;
     $('level').style.width = (Math.min(1,s.level*3)*100)+'%';
     $('message').textContent = localError || s.message;
     $('progress').value = s.progress;
@@ -153,12 +178,15 @@ async function poll() {
       }
     }
     $('recovery').hidden = busy || !s.pending.length;
-  } catch(e) { if (!stopping) error(new Error('프로그램 연결이 끊겼습니다. EXE를 다시 실행하면 보존된 녹음을 확인할 수 있습니다.')); }
+  } catch(e) { error(e); }
 }
 $('start').onclick=start;
 $('stop').onclick=()=> recording ? stop() : api('stop',{error:'녹음 화면이 다시 열렸습니다. 받은 구간을 보존합니다.'}).catch(error);
 $('source').onchange=labels; $('engine').onchange=labels;
-$('screenshots').onchange=labels;
+$('screenshots').onchange=labels; $('timed').onchange=labels;
+$('autoExit').onchange=()=>api('auto-exit',{enabled:$('autoExit').checked}).catch(error);
+// Tells the program the window really closed (reloads poll again right away and cancel this).
+window.addEventListener('pagehide',()=>navigator.sendBeacon(new URL('closed',base)));
 $('prepare').onclick=async()=>{localError='';try{await api('model',settings());poll();}catch(e){error(e);}};
 $('folder').onclick=()=>api('folder',{}).catch(error);
 $('open').onclick=()=>api('open',{}).catch(error);
